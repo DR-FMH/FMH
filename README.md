@@ -1,3 +1,24 @@
+> ## FMH Distribution Notice
+>
+> FMH is an independently maintained derivative of the OpenCode project.
+> The original OpenCode source code and project history retain their
+> original copyright notices and license.
+>
+> FMH adds a governed knowledge-augmented runtime and Engineering Memory
+> System, including first-turn retrieval, candidate extraction, separate
+> staging, mandatory human review, approved-only admission, post-write
+> compensation, a production memory CLI, and retrieval abstention.
+>
+> FMH does not provide automatic approval or automatic admission.
+>
+> Original project:
+> https://github.com/anomalyco/opencode
+>
+> FMH organization:
+> https://github.com/DR-FMH
+>
+> See NOTICE-FMH.md for full attribution details.
+
 <p align="center">
   <a href="https://opencode.ai">
     <picture>
