@@ -1,0 +1,216 @@
+name: FMH CI
+
+on:
+  pull_request:
+    branches: [dev]
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+concurrency:
+  group: fmh-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fmh-changes:
+    name: FMH changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs_only: ${{ steps.detect.outputs.docs_only }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CHANGED=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.sha }}"
+            if [ -n "$BASE" ] && git cat-file -e "$BASE" 2>/dev/null && git cat-file -e "$HEAD" 2>/dev/null; then
+              CHANGED=$(git diff --name-only "$BASE"... "$HEAD" || true)
+            fi
+          else
+            BEFORE="${{ github.event.before || '' }}"
+            if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+              CHANGED=$(git diff --name-only "$BEFORE"... "${{ github.sha }}" || true)
+            fi
+          fi
+
+          echo "Changed files:"
+          echo "${CHANGED:-<detection-failed>}"
+
+          # On ambiguity, run everything. Never allow path detection
+          # to silently skip all checks.
+          if [ -z "$CHANGED" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          DOCS_ONLY=true
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              README.md|NOTICE-FMH.md|docs/*|*.md) ;;
+              *) DOCS_ONLY=false; break ;;
+            esac
+          done <<< "$CHANGED"
+
+          echo "docs_only=$DOCS_ONLY" >> "$GITHUB_OUTPUT"
+
+  fmh-governance:
+    name: FMH governance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 1
+
+      - name: Run FMH governance checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          FAIL=0
+
+          echo "=== 1. README contains FMH Distribution Notice ==="
+          if grep -q "FMH Distribution Notice" README.md; then
+            echo "ok: README contains FMH Distribution Notice"
+          else
+            echo "::error::README.md is missing 'FMH Distribution Notice'"
+            FAIL=1
+          fi
+
+          echo "=== 2. NOTICE-FMH.md exists with upstream attribution ==="
+          if [ -f NOTICE-FMH.md ] && grep -q "https://github.com/anomalyco/opencode" NOTICE-FMH.md; then
+            echo "ok: NOTICE-FMH.md exists with upstream attribution"
+          else
+            echo "::error::NOTICE-FMH.md is missing or lacks upstream attribution"
+            FAIL=1
+          fi
+
+          echo "=== 3. README keeps upstream attribution ==="
+          if grep -q "anomalyco/opencode" README.md; then
+            echo "ok: README keeps upstream attribution"
+          else
+            echo "::error::README.md is missing upstream attribution (anomalyco/opencode)"
+            FAIL=1
+          fi
+
+          echo "=== 4. No committed database or backup artifacts ==="
+          if git ls-files | grep -E '\.(db|sqlite|sqlite3|sqlite-wal|sqlite-shm|backup|bak)$|(^|/)\.env$' ; then
+            echo "::error::Committed database/backup artifacts detected above"
+            FAIL=1
+          else
+            echo "ok: no committed .db/.sqlite/WAL/SHM/backup files"
+          fi
+
+          echo "=== 5. Scoped secret pattern scan ==="
+          # Scoped: lockfiles carry hashes, patches carry diffs, test
+          # fixtures carry documented EXAMPLE placeholders, .env.example
+          # carries placeholder names, and redaction/extraction sources
+          # carry detection regexes by design. Remaining hits are treated
+          # as committed secret material.
+          MATCHES=$(git grep -n -E 'sk-ant-[A-Za-z0-9_-]{10,}|sk-proj-[A-Za-z0-9_-]{10,}|ghp_[A-Za-z0-9]{30,}|gho_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,}|-----BEGIN .*PRIVATE KEY-----' -- ':!bun.lock' ':!**/bun.lock' ':!patches/**' ':!**/*.test.ts' ':!**/test/**' ':!**/tests/**' ':!**/.env.example' 2>/dev/null || true)
+          MATCHES=$(echo "$MATCHES" | grep -v -E 'redaction\.ts|/extraction\.ts|EXAMPLE|example|placeholder|your-|1234567890' || true)
+          if [ -n "$MATCHES" ]; then
+            echo "$MATCHES"
+            echo "::error::Possible committed secret material detected above"
+            FAIL=1
+          else
+            echo "ok: no secret patterns detected"
+          fi
+
+          echo "=== 6. No automatic approval/admission claims ==="
+          if grep -qi "does not provide automatic approval" README.md NOTICE-FMH.md 2>/dev/null; then
+            echo "ok: disclaimer present (no automatic approval)"
+          else
+            echo "::error::FMH disclaimer about automatic approval is missing"
+            FAIL=1
+          fi
+          if git grep -n -i -E 'automatic(ally)? +[^.]{0,60}(approv|admit)[^.]{0,40}(enabled|supported|available|granted|allowed by default)' -- README.md NOTICE-FMH.md docs 2>/dev/null; then
+            echo "::error::Docs claim automatic approval/admission as supported"
+            FAIL=1
+          else
+            echo "ok: no unsupported automatic-approval claims"
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::FMH governance checks failed"
+            exit 1
+          fi
+          echo "All FMH governance checks passed"
+
+  fmh-knowledge:
+    name: FMH knowledge
+    needs: fmh-changes
+    if: needs.fmh-changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          install-flags: "--frozen-lockfile"
+
+      - name: Typecheck knowledge-engine
+        run: bun --cwd packages/knowledge-engine run typecheck
+
+      - name: Test knowledge-engine
+        run: bun --cwd packages/knowledge-engine test
+
+  fmh-core:
+    name: FMH core
+    needs: fmh-changes
+    if: needs.fmh-changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          install-flags: "--frozen-lockfile"
+
+      - name: Typecheck core
+        run: bun --cwd packages/core run typecheck
+
+  fmh-opencode:
+    name: FMH opencode
+    needs: fmh-changes
+    if: needs.fmh-changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          install-flags: "--frozen-lockfile"
+
+      - name: Typecheck opencode
+        run: bun --cwd packages/opencode run typecheck
+
+      - name: Test learn-memory CLI
+        run: bun --cwd packages/opencode test ./test/cli/learn-memory.test.ts
+
+      - name: Test account CLI
+        run: bun --cwd packages/opencode test ./test/cli/account.test.ts
