@@ -174,3 +174,50 @@ jobs:
 
       - name: Test account CLI
         run: bun --cwd packages/opencode test ./test/cli/account.test.ts
+
+  fmh-required:
+    name: FMH required
+    if: always()
+    needs:
+      - fmh-changes
+      - fmh-governance
+      - fmh-knowledge
+      - fmh-core
+      - fmh-opencode
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Enforce FMH required results
+        shell: bash
+        env:
+          DOCS_ONLY: ${{ needs.fmh-changes.outputs.docs_only }}
+          CHANGES_RESULT: ${{ needs.fmh-changes.result }}
+          GOVERNANCE_RESULT: ${{ needs.fmh-governance.result }}
+          KNOWLEDGE_RESULT: ${{ needs.fmh-knowledge.result }}
+          CORE_RESULT: ${{ needs.fmh-core.result }}
+          OPENCODE_RESULT: ${{ needs.fmh-opencode.result }}
+        run: |
+          set -euo pipefail
+          echo "docs_only=$DOCS_ONLY"
+          echo "changes=$CHANGES_RESULT"
+          echo "governance=$GOVERNANCE_RESULT"
+          echo "knowledge=$KNOWLEDGE_RESULT"
+          echo "core=$CORE_RESULT"
+          echo "opencode=$OPENCODE_RESULT"
+          [ "$CHANGES_RESULT" = "success" ]
+          [ "$GOVERNANCE_RESULT" = "success" ]
+          if [ "$DOCS_ONLY" = "true" ]; then
+            for result in "$KNOWLEDGE_RESULT" "$CORE_RESULT" "$OPENCODE_RESULT"; do
+              case "$result" in
+                success|skipped) ;;
+                *) exit 1 ;;
+              esac
+            done
+          else
+            [ "$KNOWLEDGE_RESULT" = "success" ]
+            [ "$CORE_RESULT" = "success" ]
+            [ "$OPENCODE_RESULT" = "success" ]
+          fi
+          echo "FMH required checks passed"
