@@ -1,0 +1,176 @@
+name: FMH CI
+
+on:
+  pull_request:
+    branches: [dev]
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+concurrency:
+  group: fmh-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fmh-changes:
+    name: FMH changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs_only: ${{ steps.detect.outputs.docs_only }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CHANGED=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.sha }}"
+            if [ -n "$BASE" ] && git cat-file -e "$BASE" 2>/dev/null && git cat-file -e "$HEAD" 2>/dev/null; then
+              CHANGED=$(git diff --name-only "$BASE"... "$HEAD" || true)
+            fi
+          else
+            BEFORE="${{ github.event.before || '' }}"
+            if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+              CHANGED=$(git diff --name-only "$BEFORE"... "${{ github.sha }}" || true)
+            fi
+          fi
+
+          echo "Changed files:"
+          echo "${CHANGED:-<detection-failed>}"
+
+          # On ambiguity, run everything. Never allow path detection
+          # to silently skip all checks.
+          if [ -z "$CHANGED" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          DOCS_ONLY=true
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              README.md|NOTICE-FMH.md|docs/*|*.md) ;;
+              *) DOCS_ONLY=false; break ;;
+            esac
+          done <<< "$CHANGED"
+
+          echo "docs_only=$DOCS_ONLY" >> "$GITHUB_OUTPUT"
+
+  fmh-governance:
+    name: FMH governance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # Full history is required: the governance script resolves the
+          # event base commit and must fail closed when it is absent.
+          fetch-depth: 0
+
+      - name: Resolve scan range
+        id: range
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            BEFORE="${{ github.event.before }}"
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              if PARENT=$(git rev-parse --verify HEAD^ 2>/dev/null); then
+                echo "base=$PARENT" >> "$GITHUB_OUTPUT"
+              else
+                echo "::error::push event has no usable base commit; failing closed"
+                exit 1
+              fi
+            else
+              echo "base=$BEFORE" >> "$GITHUB_OUTPUT"
+            fi
+            echo "head=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            # workflow_dispatch and any other event: scan the latest commit.
+            # The script fails closed when HEAD has no parent.
+            echo "base=$(git rev-parse --verify HEAD^)" >> "$GITHUB_OUTPUT"
+            echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run FMH governance checks
+        shell: bash
+        run: bash .github/scripts/fmh-governance-check.sh --base "${{ steps.range.outputs.base }}" --head "${{ steps.range.outputs.head }}"
+
+  fmh-knowledge:
+    name: FMH knowledge
+    needs: fmh-changes
+    if: needs.fmh-changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          install-flags: "--frozen-lockfile"
+
+      - name: Typecheck knowledge-engine
+        run: bun --cwd packages/knowledge-engine run typecheck
+
+      - name: Test knowledge-engine
+        run: bun --cwd packages/knowledge-engine test
+
+  fmh-core:
+    name: FMH core
+    needs: fmh-changes
+    if: needs.fmh-changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          install-flags: "--frozen-lockfile"
+
+      - name: Typecheck core
+        run: bun --cwd packages/core run typecheck
+
+  fmh-opencode:
+    name: FMH opencode
+    needs: fmh-changes
+    if: needs.fmh-changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          install-flags: "--frozen-lockfile"
+
+      - name: Typecheck opencode
+        run: bun --cwd packages/opencode run typecheck
+
+      - name: Test learn-memory CLI
+        run: bun --cwd packages/opencode test ./test/cli/learn-memory.test.ts
+
+      - name: Test account CLI
+        run: bun --cwd packages/opencode test ./test/cli/account.test.ts
