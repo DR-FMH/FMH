@@ -76,81 +76,41 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          fetch-depth: 1
+          # Full history is required: the governance script resolves the
+          # event base commit and must fail closed when it is absent.
+          fetch-depth: 0
 
-      - name: Run FMH governance checks
+      - name: Resolve scan range
+        id: range
         shell: bash
         run: |
           set -euo pipefail
-          FAIL=0
-
-          echo "=== 1. README contains FMH Distribution Notice ==="
-          if grep -q "FMH Distribution Notice" README.md; then
-            echo "ok: README contains FMH Distribution Notice"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            BEFORE="${{ github.event.before }}"
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              if PARENT=$(git rev-parse --verify HEAD^ 2>/dev/null); then
+                echo "base=$PARENT" >> "$GITHUB_OUTPUT"
+              else
+                echo "::error::push event has no usable base commit; failing closed"
+                exit 1
+              fi
+            else
+              echo "base=$BEFORE" >> "$GITHUB_OUTPUT"
+            fi
+            echo "head=${{ github.sha }}" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::README.md is missing 'FMH Distribution Notice'"
-            FAIL=1
-          fi
-
-          echo "=== 2. NOTICE-FMH.md exists with upstream attribution ==="
-          if [ -f NOTICE-FMH.md ] && grep -q "https://github.com/anomalyco/opencode" NOTICE-FMH.md; then
-            echo "ok: NOTICE-FMH.md exists with upstream attribution"
-          else
-            echo "::error::NOTICE-FMH.md is missing or lacks upstream attribution"
-            FAIL=1
-          fi
-
-          echo "=== 3. README keeps upstream attribution ==="
-          if grep -q "anomalyco/opencode" README.md; then
-            echo "ok: README keeps upstream attribution"
-          else
-            echo "::error::README.md is missing upstream attribution (anomalyco/opencode)"
-            FAIL=1
+            # workflow_dispatch and any other event: scan the latest commit.
+            # The script fails closed when HEAD has no parent.
+            echo "base=$(git rev-parse --verify HEAD^)" >> "$GITHUB_OUTPUT"
+            echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "=== 4. No committed database or backup artifacts ==="
-          if git ls-files | grep -E '\.(db|sqlite|sqlite3|sqlite-wal|sqlite-shm|backup|bak)$|(^|/)\.env$' ; then
-            echo "::error::Committed database/backup artifacts detected above"
-            FAIL=1
-          else
-            echo "ok: no committed .db/.sqlite/WAL/SHM/backup files"
-          fi
-
-          echo "=== 5. Scoped secret pattern scan ==="
-          # Scoped: lockfiles carry hashes, patches carry diffs, test
-          # fixtures carry documented EXAMPLE placeholders, .env.example
-          # carries placeholder names, and redaction/extraction sources
-          # carry detection regexes by design. Remaining hits are treated
-          # as committed secret material.
-          MATCHES=$(git grep -n -E 'sk-ant-[A-Za-z0-9_-]{10,}|sk-proj-[A-Za-z0-9_-]{10,}|ghp_[A-Za-z0-9]{30,}|gho_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,}|-----BEGIN .*PRIVATE KEY-----' -- ':!bun.lock' ':!**/bun.lock' ':!patches/**' ':!**/*.test.ts' ':!**/test/**' ':!**/tests/**' ':!**/.env.example' 2>/dev/null || true)
-          MATCHES=$(echo "$MATCHES" | grep -v -E 'redaction\.ts|/extraction\.ts|EXAMPLE|example|placeholder|your-|1234567890' || true)
-          if [ -n "$MATCHES" ]; then
-            echo "$MATCHES"
-            echo "::error::Possible committed secret material detected above"
-            FAIL=1
-          else
-            echo "ok: no secret patterns detected"
-          fi
-
-          echo "=== 6. No automatic approval/admission claims ==="
-          if grep -qi "does not provide automatic approval" README.md NOTICE-FMH.md 2>/dev/null; then
-            echo "ok: disclaimer present (no automatic approval)"
-          else
-            echo "::error::FMH disclaimer about automatic approval is missing"
-            FAIL=1
-          fi
-          if git grep -n -i -E 'automatic(ally)? +[^.]{0,60}(approv|admit)[^.]{0,40}(enabled|supported|available|granted|allowed by default)' -- README.md NOTICE-FMH.md docs 2>/dev/null; then
-            echo "::error::Docs claim automatic approval/admission as supported"
-            FAIL=1
-          else
-            echo "ok: no unsupported automatic-approval claims"
-          fi
-
-          if [ "$FAIL" -ne 0 ]; then
-            echo "::error::FMH governance checks failed"
-            exit 1
-          fi
-          echo "All FMH governance checks passed"
+      - name: Run FMH governance checks
+        shell: bash
+        run: bash .github/scripts/fmh-governance-check.sh --base "${{ steps.range.outputs.base }}" --head "${{ steps.range.outputs.head }}"
 
   fmh-knowledge:
     name: FMH knowledge
